@@ -1755,3 +1755,4 @@ st.caption(
     "Interpretation note: a flag identifies a meaningful change under the selected rules. "
     "It does not establish that nutrition caused the change. Review the athlete's training, health, schedule, role, and measurement context alongside the nutrition record."
 )
+
