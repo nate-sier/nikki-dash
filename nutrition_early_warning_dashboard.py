@@ -1524,11 +1524,11 @@ def _pdf_draw_metric_table(
                 "—",
                 "—",
                 hydration_status,
-                "—",
+                np.nan,
             )
         )
     else:
-        rows.append(("Sweat Sodium", "—", "—", "—", "No result", "—"))
+        rows.append(("Sweat Sodium", "—", "—", "—", "No result", np.nan))
 
     headers = ["Metric", "Current", "Comparison", "Change", "Status", "Age"]
     fractions = [0.17, 0.18, 0.18, 0.20, 0.18, 0.09]
@@ -1561,10 +1561,13 @@ def _pdf_draw_metric_table(
                 c.setFont("Helvetica", 7.8)
             text = "-" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
             if j == 5:
-                if pd.isna(value):
+                # Age is numeric for performance metrics, but hydration rows use a dash/no age.
+                # Convert defensively so strings like "—" cannot crash PDF generation.
+                try:
+                    age_value = float(value)
+                    text = f"{int(age_value)}d" if np.isfinite(age_value) else "-"
+                except (TypeError, ValueError):
                     text = "-"
-                else:
-                    text = f"{int(value)}d"
             max_chars = max(6, int(cw / 4.5))
             if len(text) > max_chars:
                 text = text[: max_chars - 1] + "..."
