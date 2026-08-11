@@ -1,34 +1,5 @@
 from __future__ import annotations
 
-"""
-Nutrition Early Warning — organization-wide Streamlit monitoring dashboard.
-
-Purpose
--------
-Surface meaningful changes in bodyweight and performance early enough for the
-nutrition department to review the athlete before a small change becomes a
-larger problem.
-
-Primary sources (same Google Sheet structure as the Performance × CI app):
-- Jump Data: athlete, date, team, bodyweight, concentric impulse (CI)
-- FB Velo: pitcher, game_date, ytd_fb_velo
-- PP_Sprint: batter/player, game_date, monthly_avg_bat_speed,
-  monthly_max_sprint_speed, team
-- Master Roster (optional): athlete/player, team, position
-
-Default comparison logic
-------------------------
-- Bodyweight: latest recent observation vs median of the preceding baseline window.
-- CI: mean of recent tests vs mean of the preceding baseline window.
-- FB velo: latest YTD FB velo vs the closest valid observation around the selected
-  lookback date.
-- Bat speed: latest eligible hitter-month vs previous eligible hitter-month.
-- Sprint speed: latest eligible player-month vs previous eligible player-month.
-
-The dashboard does NOT diagnose nutrition problems. A flag means "review this
-change in context". Thresholds are adjustable in the sidebar.
-"""
-
 import html
 import hmac
 import os
@@ -240,7 +211,7 @@ def normalize_team(value) -> str | None:
     if not raw or raw.lower() in {"nan", "none"}:
         return None
     key = re.sub(r"[^A-Z0-9]", "", raw.upper())
-    return KNOWN_TEAM_ALIASES.get(key, raw)
+    return KNOWN_TEAM_ALIASES.get(key)
 
 
 def fmt(value, digits=1, suffix="") -> str:
@@ -452,6 +423,13 @@ def load_source_data() -> SourceBundle:
     velo_date_col = first_existing(
         velo_raw.columns.tolist(), ["game_date", "Game_Date", "Game Date", "date", "Date"]
     )
+    velo_fb_col = first_existing(
+        velo_raw.columns.tolist(),
+        [
+            "fb_velo", "FB_Velo", "FB Velo", "fb velo",
+            "fastball_velo", "Fastball Velo", "Fastball Velocity",
+        ],
+    )
     velo_ytd_col = first_existing(
         velo_raw.columns.tolist(),
         [
@@ -459,19 +437,25 @@ def load_source_data() -> SourceBundle:
             "ytd fastball velo", "ytd_fastball_velo",
         ],
     )
-    if any(col is None for col in [velo_name_col, velo_date_col, velo_ytd_col]):
-        raise ValueError("FB Velo requires pitcher/name, game date, and ytd_fb_velo columns.")
+    if any(col is None for col in [velo_name_col, velo_date_col, velo_fb_col, velo_ytd_col]):
+        raise ValueError(
+            "FB Velo requires pitcher/name, game date, fb_velo, and ytd_fb_velo columns."
+        )
 
     velo = pd.DataFrame({
         "athlete": velo_raw[velo_name_col].astype(str).str.strip(),
         "date": parse_sheet_dates(velo_raw[velo_date_col]),
+        "fb_velo": pd.to_numeric(velo_raw[velo_fb_col], errors="coerce"),
         "ytd_fb_velo": pd.to_numeric(velo_raw[velo_ytd_col], errors="coerce"),
     })
     velo["name_key"] = velo["athlete"].map(canonical_name)
     velo = velo[
         (velo["athlete"] != "") & (velo["name_key"] != "")
-    ].dropna(subset=["date", "ytd_fb_velo"])
-    velo = velo[velo["ytd_fb_velo"].between(50, 110)].copy()
+    ].dropna(subset=["date", "fb_velo", "ytd_fb_velo"])
+    velo = velo[
+        velo["fb_velo"].between(50, 110)
+        & velo["ytd_fb_velo"].between(50, 110)
+    ].copy()
     velo = velo.sort_values(["name_key", "date"], kind="stable").reset_index(drop=True)
 
     # ----- PP_Sprint monthly bat/sprint speed -----
@@ -647,9 +631,9 @@ def build_player_directory(bundle: SourceBundle, as_of_date) -> pd.DataFrame:
         directory["athlete"] = directory["athlete"].combine_first(directory["velo_athlete"])
         directory = directory.drop(columns=["velo_athlete"])
 
-    directory["team"] = directory["team"].fillna("Unassigned")
     directory["athlete"] = directory["athlete"].fillna(directory["name_key"])
     directory["position"] = directory.get("position", "").fillna("")
+    directory = directory[directory["team"].isin(TEAM_ORDER)].copy()
     return directory.drop_duplicates("name_key", keep="last").reset_index(drop=True)
 
 
@@ -741,39 +725,34 @@ def ci_snapshot(
 def velo_snapshot(
     velo: pd.DataFrame,
     as_of_date,
-    lookback_days: int,
-    reference_tolerance_days: int = 21,
 ) -> pd.DataFrame:
+    """Compare the latest row's fb_velo with that same row's ytd_fb_velo."""
     as_of = pd.Timestamp(as_of_date).normalize()
-    target = as_of - pd.Timedelta(days=max(1, lookback_days))
-    tolerance = pd.Timedelta(days=max(1, reference_tolerance_days))
-
     rows = []
-    for name_key, group in velo[velo["date"] <= as_of].groupby("name_key", sort=False):
-        group = group.sort_values("date")
-        if group.empty:
-            continue
-        current_row = group.iloc[-1]
-        candidates = group[group["date"] <= target]
-        if candidates.empty:
-            continue
-        reference_row = candidates.iloc[-1]
-        # Do not compare a current value to a reference that is far older than intended.
-        if target - reference_row["date"] > tolerance:
-            continue
+    work = velo[
+        (velo["date"] <= as_of)
+        & velo["fb_velo"].notna()
+        & velo["ytd_fb_velo"].notna()
+    ].copy()
+
+    for name_key, group in work.groupby("name_key", sort=False):
+        current_row = group.sort_values("date").iloc[-1]
         rows.append({
             "name_key": name_key,
-            "velo_current": float(current_row["ytd_fb_velo"]),
+            "velo_current": float(current_row["fb_velo"]),
             "velo_current_date": current_row["date"],
-            "velo_baseline": float(reference_row["ytd_fb_velo"]),
-            "velo_baseline_date": reference_row["date"],
+            "velo_baseline": float(current_row["ytd_fb_velo"]),
+            "velo_baseline_date": current_row["date"],
         })
+
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=[
             "name_key", "velo_current", "velo_current_date", "velo_baseline",
             "velo_baseline_date", "velo_change", "velo_change_pct",
         ])
+
+    # Negative values mean current FB velocity is below the player's YTD FB velocity.
     out["velo_change"] = out["velo_current"] - out["velo_baseline"]
     out["velo_change_pct"] = out["velo_change"] / out["velo_baseline"] * 100.0
     return out
@@ -875,14 +854,13 @@ def build_alert_table(
     as_of_date,
     recent_days: int,
     baseline_days: int,
-    velo_lookback_days: int,
     bat_min_days: int,
     sprint_min_days: int,
     thresholds: Thresholds,
 ) -> pd.DataFrame:
     bw = bodyweight_snapshot(bundle.jump, as_of_date, recent_days, baseline_days)
     ci = ci_snapshot(bundle.jump, as_of_date, recent_days, baseline_days)
-    velo = velo_snapshot(bundle.velo, as_of_date, velo_lookback_days)
+    velo = velo_snapshot(bundle.velo, as_of_date)
     bat = monthly_metric_snapshot(
         bundle.monthly, "monthly_avg_bat_speed", as_of_date, bat_min_days, "bat"
     )
@@ -1116,6 +1094,45 @@ def build_time_series(
     return base_figure_layout(fig, 300)
 
 
+def build_velo_time_series(df: pd.DataFrame) -> go.Figure:
+    """Plot game/current fb_velo and ytd_fb_velo together over time."""
+    work = df[["date", "fb_velo", "ytd_fb_velo"]].dropna().sort_values("date")
+    fig = go.Figure()
+    if work.empty:
+        fig.add_annotation(
+            text="No data available.", x=0.5, y=0.5, xref="paper", yref="paper",
+            showarrow=False, font={"color": SUBTEXT, "size": 14},
+        )
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+        return base_figure_layout(fig, 300)
+
+    fig.add_trace(go.Scatter(
+        x=work["date"], y=work["fb_velo"], mode="lines+markers",
+        name="FB Velo",
+        line={"color": ACCENT_RED, "width": 2.3},
+        marker={"size": 7, "color": ACCENT_RED},
+        hovertemplate="<b>FB Velo</b><br>%{x|%b %d, %Y}<br>%{y:.2f} mph<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=work["date"], y=work["ytd_fb_velo"], mode="lines",
+        name="YTD FB Velo",
+        line={"color": NAVY_MID, "width": 2.0, "dash": "dash"},
+        hovertemplate="<b>YTD FB Velo</b><br>%{x|%b %d, %Y}<br>%{y:.2f} mph<extra></extra>",
+    ))
+    fig.update_xaxes(showgrid=False, linecolor=BORDER, tickfont={"color": SUBTEXT})
+    fig.update_yaxes(
+        title="Fastball velocity (mph)", showgrid=True, gridcolor=GRID, zeroline=False,
+        linecolor=BORDER, tickfont={"color": SUBTEXT}, title_font={"color": SUBTEXT},
+    )
+    fig = base_figure_layout(fig, 300)
+    fig.update_layout(
+        showlegend=True,
+        legend={"orientation": "h", "x": 0, "y": 1.12, "font": {"color": SUBTEXT}},
+    )
+    return fig
+
+
 # -----------------------------------------------------------------------------
 # PASSWORD AUTHENTICATION
 # -----------------------------------------------------------------------------
@@ -1222,7 +1239,6 @@ with st.sidebar:
     st.markdown("**Comparison windows**")
     recent_days = st.slider("Recent BW / CI window", 7, 28, 14, 1)
     baseline_days = st.slider("Prior BW / CI baseline", 14, 56, 28, 7)
-    velo_lookback_days = st.slider("FB velo lookback", 14, 56, 28, 7)
     bat_min_days = st.slider("Bat-speed minimum data dates", 1, 20, 7, 1)
     sprint_min_days = st.slider("Sprint-speed minimum data dates", 1, 25, 14, 1)
 
@@ -1268,7 +1284,6 @@ alerts_all = build_alert_table(
     as_of_date=as_of_date,
     recent_days=recent_days,
     baseline_days=baseline_days,
-    velo_lookback_days=velo_lookback_days,
     bat_min_days=bat_min_days,
     sprint_min_days=sprint_min_days,
     thresholds=thresholds,
@@ -1306,7 +1321,7 @@ with c4:
 
 st.caption(
     f"As of {fmt_date(as_of_date)} · BW/CI recent {recent_days}d vs prior {baseline_days}d · "
-    f"FB velo lookback {velo_lookback_days}d · Bat minimum {bat_min_days} dates/month · "
+    f"FB velo = current fb_velo vs same-row YTD · Bat minimum {bat_min_days} dates/month · "
     f"Sprint minimum {sprint_min_days} dates/month"
 )
 
@@ -1431,6 +1446,8 @@ def render_metric_tab(
     change_bar_title: str,
     pct_bar: bool = False,
     digits: int = 2,
+    current_label: str = "Current",
+    baseline_label: str = "Baseline",
 ):
     valid = data[data[change_col].notna()].copy()
     flags = valid[valid[level_col] > 0].copy()
@@ -1475,8 +1492,8 @@ def render_metric_tab(
                 "athlete": "Player",
                 "team": "Team",
                 "Status": "Overall Status",
-                current_col: "Current",
-                baseline_col: "Baseline",
+                current_col: current_label,
+                baseline_col: baseline_label,
                 change_col: "Change",
                 current_date_col: "Current As Of",
                 baseline_date_col: "Baseline As Of",
@@ -1488,8 +1505,8 @@ def render_metric_tab(
             detail["Baseline As Of"] = detail["Baseline As Of"].map(fmt_date)
             detail = detail.sort_values("Change", na_position="last")
             column_config = {
-                "Current": st.column_config.NumberColumn(format=f"%.{digits}f {unit}" if unit else f"%.{digits}f"),
-                "Baseline": st.column_config.NumberColumn(format=f"%.{digits}f {unit}" if unit else f"%.{digits}f"),
+                current_label: st.column_config.NumberColumn(format=f"%.{digits}f {unit}" if unit else f"%.{digits}f"),
+                baseline_label: st.column_config.NumberColumn(format=f"%.{digits}f {unit}" if unit else f"%.{digits}f"),
                 "Change": st.column_config.NumberColumn(format=f"%+.{digits}f {unit}" if unit else f"%+.{digits}f"),
             }
             if change_pct_col:
@@ -1556,7 +1573,8 @@ with ci_tab:
 with velo_tab:
     st.subheader("Fastball Velocity Change Monitoring", anchor=False)
     st.caption(
-        "Uses the existing ytd_fb_velo field. Current is the latest YTD value; baseline is the most recent value at or before the selected lookback date. "
+        "Compares the latest fb_velo with ytd_fb_velo from the same row/date. "
+        "A negative difference means current fastball velocity is running below the pitcher's YTD fastball velocity. "
         "Only declines trigger velocity alerts."
     )
     render_metric_tab(
@@ -1570,9 +1588,11 @@ with velo_tab:
         current_date_col="velo_current_date",
         baseline_date_col="velo_baseline_date",
         unit="mph",
-        change_bar_title="FB velo change",
+        change_bar_title="FB velo vs YTD",
         pct_bar=False,
         digits=2,
+        current_label="FB Velo",
+        baseline_label="YTD FB Velo",
     )
 
 with bat_tab:
@@ -1692,9 +1712,7 @@ with player_tab:
             with st.container(border=True):
                 st.subheader("FB Velo", anchor=False)
                 st.plotly_chart(
-                    build_time_series(
-                        velo_player, "date", "ytd_fb_velo", "FB velo", "YTD FB velo (mph)", row.get("velo_baseline")
-                    ),
+                    build_velo_time_series(velo_player),
                     use_container_width=True, config={"displayModeBar": False}, key=f"player_velo_{key}",
                 )
         with b:
