@@ -2743,20 +2743,51 @@ with report_tab:
         report_row = alerts[alerts["name_key"] == report_selected["name_key"]].iloc[0]
 
         # Keep separate report notes for each player during the current app session.
+        # IMPORTANT: Streamlit download buttons can use bytes created before the latest
+        # text-area edit is committed. Use an explicit Update PDF button so the newest
+        # note is guaranteed to be captured before the downloadable PDF is rebuilt.
         notes_store = st.session_state.setdefault("player_report_notes", {})
         report_name_key = str(report_row.get("name_key", ""))
-        report_notes = st.text_area(
+        note_widget_key = f"player_report_notes_input_{safe_filename(report_name_key)}"
+        if note_widget_key not in st.session_state:
+            st.session_state[note_widget_key] = str(notes_store.get(report_name_key, ""))
+
+        st.text_area(
             "Report notes",
-            value=str(notes_store.get(report_name_key, "")),
             height=110,
-            key=f"player_report_notes_input_{safe_filename(report_name_key)}",
+            key=note_widget_key,
             placeholder="Type any context or follow-up notes to include on this player's PDF...",
         )
-        notes_store[report_name_key] = report_notes
 
-        report_pdf = generate_player_report_pdf(
-            report_row, bundle, as_of_date, report_notes=report_notes
-        )
+        pdf_state_key = f"player_report_pdf_{safe_filename(report_name_key)}"
+        pdf_note_state_key = f"player_report_pdf_note_{safe_filename(report_name_key)}"
+
+        if st.button(
+            "Update PDF with report notes",
+            key=f"update_player_report_pdf_{safe_filename(report_name_key)}",
+            use_container_width=True,
+        ):
+            current_notes = str(st.session_state.get(note_widget_key, ""))
+            notes_store[report_name_key] = current_notes
+            st.session_state[pdf_state_key] = generate_player_report_pdf(
+                report_row, bundle, as_of_date, report_notes=current_notes
+            )
+            st.session_state[pdf_note_state_key] = current_notes
+
+        # Build an initial report the first time the player is opened. After that, the
+        # explicit Update PDF button is the source of truth for newly edited notes.
+        if pdf_state_key not in st.session_state:
+            saved_notes = str(notes_store.get(report_name_key, ""))
+            st.session_state[pdf_state_key] = generate_player_report_pdf(
+                report_row, bundle, as_of_date, report_notes=saved_notes
+            )
+            st.session_state[pdf_note_state_key] = saved_notes
+
+        report_pdf = st.session_state[pdf_state_key]
+        active_pdf_notes = str(st.session_state.get(pdf_note_state_key, ""))
+        current_editor_notes = str(st.session_state.get(note_widget_key, ""))
+        if current_editor_notes != active_pdf_notes:
+            st.info("Notes have changed. Click **Update PDF with report notes** before downloading.")
 
         hydration_record = get_player_hydration(
             bundle,
