@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# BUILD: 2026-08-11-1620 — source-sheet sweat-test values, report role filtering, report notes
+
 import html
 import hmac
 import io
@@ -227,6 +229,36 @@ def normalize_team(value) -> str | None:
         return None
     key = re.sub(r"[^A-Z0-9]", "", raw.upper())
     return KNOWN_TEAM_ALIASES.get(key)
+
+
+def is_pitcher_position(value) -> bool:
+    """Return True for roster positions that represent pitchers."""
+    if value is None or pd.isna(value):
+        return False
+    raw = str(value).strip().upper()
+    if not raw or raw in {"NA", "N/A", "NONE", "NAN"}:
+        return False
+    if "PITCH" in raw:
+        return True
+    tokens = set(re.findall(r"[A-Z0-9]+", raw))
+    return bool(tokens & {"P", "RHP", "LHP", "SP", "RP"})
+
+
+def is_position_player_position(value) -> bool:
+    """Return True for hitter/position-player roster positions."""
+    if value is None or pd.isna(value) or is_pitcher_position(value):
+        return False
+    raw = str(value).strip().upper()
+    if not raw or raw in {"NA", "N/A", "NONE", "NAN"}:
+        return False
+    if "POSITION PLAYER" in raw:
+        return True
+    tokens = set(re.findall(r"[A-Z0-9]+", raw))
+    position_tokens = {
+        "C", "INF", "IF", "OF", "1B", "2B", "3B", "SS",
+        "LF", "CF", "RF", "DH", "UT", "UTIL", "UTILITY",
+    }
+    return bool(tokens & position_tokens)
 
 
 def clean_hydration_player_name(value) -> str:
@@ -1151,6 +1183,14 @@ def build_alert_table(
         lambda x: decline_flag_level(x, thresholds.sprint_monitor, thresholds.sprint_review)
     )
 
+    # Role-specific performance metrics. The Master Roster uses positions such as
+    # P, C, INF, and OF. FB velocity is pitcher-only; bat and sprint speed are
+    # position-player-only. Bodyweight and CI remain applicable to everyone.
+    pitcher_mask = out["position"].map(is_pitcher_position).fillna(False)
+    position_player_mask = out["position"].map(is_position_player_position).fillna(False)
+    out.loc[~pitcher_mask, "velo_level"] = 0
+    out.loc[~position_player_mask, ["bat_level", "sprint_level"]] = 0
+
     # Freshness rule: an observation more than 30 days old can still be shown
     # historically, but it cannot generate a Monitor/Review flag. Freshness is
     # evaluated relative to the selected dashboard as-of date.
@@ -1206,12 +1246,25 @@ def build_alert_table(
         "sprint": "sprint_change",
     }
     fresh_comparisons = pd.DataFrame(index=out.index)
+    applicability = {
+        "bw": pd.Series(True, index=out.index),
+        "ci": pd.Series(True, index=out.index),
+        "velo": pitcher_mask,
+        "bat": position_player_mask,
+        "sprint": position_player_mask,
+    }
+    stale_applicable = pd.DataFrame(index=out.index)
     for prefix, comparison_col in comparison_map.items():
+        applicable = applicability[prefix].fillna(False)
         fresh_comparisons[prefix] = (
-            out[comparison_col].notna() & ~out[f"{prefix}_stale"].fillna(False)
+            applicable
+            & out[comparison_col].notna()
+            & ~out[f"{prefix}_stale"].fillna(False)
         )
+        stale_applicable[prefix] = applicable & out[f"{prefix}_stale"].fillna(False)
     out["metrics_with_comparison"] = fresh_comparisons.sum(axis=1)
-    out["stale_metrics"] = out[[f"{p}_stale" for p in comparison_map]].sum(axis=1)
+    out["metrics_applicable"] = pd.DataFrame(applicability).sum(axis=1)
+    out["stale_metrics"] = stale_applicable.sum(axis=1)
 
     status_order = {"Review": 0, "Monitor": 1, "Stable": 2}
     out["_status_order"] = out["Status"].map(status_order).fillna(3)
@@ -1458,14 +1511,34 @@ def _report_status_color(status: str):
     return HexColor(GREEN)
 
 
+def hydration_report_summary(hydration_record: pd.Series | None) -> dict | None:
+    """Return the sweat-test result exactly as provided by the source sheet.
+
+    No threshold or salty-sweater classification is inferred in the dashboard.
+    If the source Sodium Loss / Results cell is blank, hydration is omitted from
+    the individual report entirely.
+    """
+    if hydration_record is None:
+        return None
+
+    result_raw = str(hydration_record.get("result_raw", "") or "").strip()
+    if not result_raw:
+        return None
+
+    return {
+        "value": result_raw,
+    }
+
+
 def _pdf_draw_metric_table(
     c,
     row: pd.Series,
     x: float,
     y_top: float,
     width: float,
-    hydration_record: pd.Series | None = None,
 ) -> float:
+    # Bodyweight and CI apply to everyone. Role-specific performance metrics are
+    # shown only for the appropriate roster position.
     rows = [
         (
             "Bodyweight",
@@ -1473,7 +1546,6 @@ def _pdf_draw_metric_table(
             fmt(row.get("bw_baseline_lb"), 1, " lb"),
             f"{fmt_signed(row.get('bw_change_lb'), 1, ' lb')} / {fmt_signed(row.get('bw_change_pct'), 1, '%')}",
             _report_metric_status(row, "bw", "bw_change_pct"),
-            row.get("bw_data_age_days"),
         ),
         (
             "CI",
@@ -1481,57 +1553,40 @@ def _pdf_draw_metric_table(
             fmt(row.get("ci_baseline"), 1, " N s"),
             fmt_signed(row.get("ci_change_pct"), 1, "%"),
             _report_metric_status(row, "ci", "ci_change_pct"),
-            row.get("ci_data_age_days"),
-        ),
-        (
-            "FB Velo",
-            fmt(row.get("velo_current"), 2, " mph"),
-            fmt(row.get("velo_baseline"), 2, " mph"),
-            fmt_signed(row.get("velo_change"), 2, " mph"),
-            _report_metric_status(row, "velo", "velo_change"),
-            row.get("velo_data_age_days"),
-        ),
-        (
-            "Bat Speed",
-            fmt(row.get("bat_current"), 2, " mph"),
-            fmt(row.get("bat_baseline"), 2, " mph"),
-            fmt_signed(row.get("bat_change"), 2, " mph"),
-            _report_metric_status(row, "bat", "bat_change"),
-            row.get("bat_data_age_days"),
-        ),
-        (
-            "Sprint Speed",
-            fmt(row.get("sprint_current"), 2, " ft/s"),
-            fmt(row.get("sprint_baseline"), 2, " ft/s"),
-            fmt_signed(row.get("sprint_change"), 2, " ft/s"),
-            _report_metric_status(row, "sprint", "sprint_change"),
-            row.get("sprint_data_age_days"),
         ),
     ]
 
-    if hydration_record is not None:
-        hydration_value = hydration_record.get("sodium_loss_mg_l", np.nan)
-        hydration_current = (
-            fmt(hydration_value, 0, " mg/L")
-            if pd.notna(hydration_value)
-            else "Result available"
-        )
-        hydration_status = str(hydration_record.get("classification", "") or "Hydration test")
+    position = row.get("position", "")
+    if is_pitcher_position(position):
         rows.append(
             (
-                "Sweat Sodium",
-                hydration_current,
-                "—",
-                "—",
-                hydration_status,
-                np.nan,
+                "FB Velo",
+                fmt(row.get("velo_current"), 2, " mph"),
+                fmt(row.get("velo_baseline"), 2, " mph"),
+                fmt_signed(row.get("velo_change"), 2, " mph"),
+                _report_metric_status(row, "velo", "velo_change"),
             )
         )
-    else:
-        rows.append(("Sweat Sodium", "—", "—", "—", "No result", np.nan))
+    elif is_position_player_position(position):
+        rows.extend([
+            (
+                "Bat Speed",
+                fmt(row.get("bat_current"), 2, " mph"),
+                fmt(row.get("bat_baseline"), 2, " mph"),
+                fmt_signed(row.get("bat_change"), 2, " mph"),
+                _report_metric_status(row, "bat", "bat_change"),
+            ),
+            (
+                "Sprint Speed",
+                fmt(row.get("sprint_current"), 2, " ft/s"),
+                fmt(row.get("sprint_baseline"), 2, " ft/s"),
+                fmt_signed(row.get("sprint_change"), 2, " ft/s"),
+                _report_metric_status(row, "sprint", "sprint_change"),
+            ),
+        ])
 
-    headers = ["Metric", "Current", "Comparison", "Change", "Status", "Age"]
-    fractions = [0.17, 0.18, 0.18, 0.20, 0.18, 0.09]
+    headers = ["Metric", "Current", "Comparison", "Change", "Status"]
+    fractions = [0.18, 0.20, 0.20, 0.23, 0.19]
     col_widths = [width * f for f in fractions]
     row_h = 22
 
@@ -1560,14 +1615,6 @@ def _pdf_draw_metric_table(
                 c.setFillColor(HexColor(TEXT))
                 c.setFont("Helvetica", 7.8)
             text = "-" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
-            if j == 5:
-                # Age is numeric for performance metrics, but hydration rows use a dash/no age.
-                # Convert defensively so strings like "—" cannot crash PDF generation.
-                try:
-                    age_value = float(value)
-                    text = f"{int(age_value)}d" if np.isfinite(age_value) else "-"
-                except (TypeError, ValueError):
-                    text = "-"
             max_chars = max(6, int(cw / 4.5))
             if len(text) > max_chars:
                 text = text[: max_chars - 1] + "..."
@@ -1695,10 +1742,93 @@ def _pdf_draw_series_chart(
         c.drawRightString(x + w - 8, y + h - 24, f"{second_label}: {second.dropna().iloc[-1]:.2f}")
 
 
+def _pdf_wrap_text(
+    c,
+    text: str,
+    font_name: str,
+    font_size: float,
+    max_width: float,
+    max_lines: int = 4,
+) -> list[str]:
+    """Wrap report notes to a small number of PDF lines without overflowing the box."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    lines: list[str] = []
+    paragraphs = raw.splitlines() or [raw]
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        if not words:
+            if lines and len(lines) < max_lines:
+                lines.append("")
+            continue
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if c.stringWidth(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                    if len(lines) >= max_lines:
+                        break
+                current = word
+        if len(lines) >= max_lines:
+            break
+        if current:
+            lines.append(current)
+        if len(lines) >= max_lines:
+            break
+
+    # If the source text did not fully fit, mark the last visible line as truncated.
+    rendered = " ".join(line for line in lines if line)
+    normalized = " ".join(raw.split())
+    if len(lines) >= max_lines and rendered != normalized:
+        last = lines[-1].rstrip()
+        suffix = "..."
+        while last and c.stringWidth(last + suffix, font_name, font_size) > max_width:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + suffix) if last else suffix
+    return lines[:max_lines]
+
+
+def _pdf_draw_notes_box(
+    c,
+    x: float,
+    y_top: float,
+    width: float,
+    notes: str,
+) -> float:
+    """Draw optional staff notes and return the bottom y-coordinate."""
+    font_name = "Helvetica"
+    font_size = 7.4
+    lines = _pdf_wrap_text(c, notes, font_name, font_size, width - 18, max_lines=4)
+    if not lines:
+        return y_top
+
+    box_h = max(38, 21 + len(lines) * 9)
+    y = y_top - box_h
+    c.setFillColor(HexColor("#F8FAFC"))
+    c.setStrokeColor(HexColor(BORDER))
+    c.roundRect(x, y, width, box_h, 6, fill=1, stroke=1)
+    c.setFillColor(HexColor(NAVY))
+    c.setFont("Helvetica-Bold", 7.4)
+    c.drawString(x + 9, y_top - 13, "REPORT NOTES")
+    c.setFillColor(HexColor(TEXT))
+    c.setFont(font_name, font_size)
+    line_y = y_top - 24
+    for line in lines:
+        c.drawString(x + 9, line_y, line)
+        line_y -= 9
+    return y
+
+
 def generate_player_report_pdf(
     row: pd.Series,
     bundle: SourceBundle,
     as_of_date,
+    report_notes: str = "",
 ) -> bytes:
     buffer = io.BytesIO()
     page_w, page_h = landscape(letter)
@@ -1723,17 +1853,35 @@ def generate_player_report_pdf(
     subtitle = team + (f" | {position}" if position else "")
     c.drawRightString(page_w - 34, page_h - 49, subtitle)
 
-    # Summary cards
+    # Hydration is report-only when an actual result exists.
+    hydration_record = get_player_hydration(
+        bundle,
+        str(row.get("name_key", "")),
+        str(row.get("team", "") or ""),
+    )
+    hydration_summary = hydration_report_summary(hydration_record)
+
+    # Summary cards: keep overall status, plus the source-sheet sweat-test result when present.
     card_y = page_h - 124
     card_h = 38
     card_gap = 8
-    card_w = (page_w - 68 - card_gap * 3) / 4
     cards = [
-        ("Overall Status", str(row.get("Status", "Stable")), _report_status_color(str(row.get("Status", "Stable")))),
-        ("Flagged Metrics", str(int(row.get("flagged_metrics", 0))), HexColor(BLUE)),
-        ("Fresh Comparisons", f"{int(row.get('metrics_with_comparison', 0))}/5", HexColor(TEAL)),
-        ("Stale Metrics", str(int(row.get("stale_metrics", 0))), HexColor(SUBTEXT)),
+        (
+            "Overall Status",
+            str(row.get("Status", "Stable")),
+            _report_status_color(str(row.get("Status", "Stable"))),
+        ),
     ]
+    if hydration_summary is not None:
+        cards.append(
+            (
+                "Sweat Test",
+                hydration_summary["value"],
+                HexColor(TEAL),
+            )
+        )
+
+    card_w = 210
     for i, (label, value, color) in enumerate(cards):
         xx = 34 + i * (card_w + card_gap)
         c.setFillColor(HexColor("#FFFFFF"))
@@ -1743,8 +1891,9 @@ def generate_player_report_pdf(
         c.setFont("Helvetica-Bold", 6.8)
         c.drawString(xx + 8, card_y + 25, label.upper())
         c.setFillColor(color)
-        c.setFont("Helvetica-Bold", 13)
-        c.drawString(xx + 8, card_y + 8, value)
+        c.setFont("Helvetica-Bold", 11.5 if len(value) > 22 else 13)
+        display_value = value if len(value) <= 32 else value[:29] + "..."
+        c.drawString(xx + 8, card_y + 8, display_value)
 
     # Flag reason / review cue
     reason = str(row.get("Why flagged", "No threshold exceeded"))
@@ -1758,20 +1907,25 @@ def generate_player_report_pdf(
         cue = cue[:147] + "..."
     c.drawString(43, page_h - 154, cue)
 
-    # Metric summary table, including the player's sweat-sodium result when available.
-    hydration_record = get_player_hydration(
-        bundle,
-        str(row.get("name_key", "")),
-        str(row.get("team", "") or ""),
-    )
+    # Metric summary table. No age column and no hydration row.
     table_bottom = _pdf_draw_metric_table(
         c,
         row,
         34,
         page_h - 184,
         page_w - 68,
-        hydration_record=hydration_record,
     )
+
+    # Optional staff notes entered from the report-generation tab.
+    notes_bottom = table_bottom
+    if str(report_notes or "").strip():
+        notes_bottom = _pdf_draw_notes_box(
+            c,
+            34,
+            table_bottom - 9,
+            page_w - 68,
+            str(report_notes).strip(),
+        )
 
     # History windows used in charts
     as_of = pd.Timestamp(as_of_date).normalize()
@@ -1793,52 +1947,68 @@ def generate_player_report_pdf(
         & (bundle.monthly["as_of_date"] <= as_of)
     ].copy()
 
-    # Five compact trend panels
-    charts_top = table_bottom - 12
+    # Role-specific trend panels. Everyone gets BW + CI. Pitchers get FB velo;
+    # position players get bat speed + sprint speed.
+    chart_defs = [
+        (
+            "Bodyweight - last 12 months",
+            jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
+            jump_player.get("bodyweight_lb", pd.Series(dtype=float)),
+            "lb", row.get("bw_baseline_lb"), None, None,
+        ),
+        (
+            "CI - last 12 months",
+            jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
+            jump_player.get("ci", pd.Series(dtype=float)),
+            "N s", row.get("ci_baseline"), None, None,
+        ),
+    ]
+
+    if is_pitcher_position(position):
+        chart_defs.append(
+            (
+                "FB Velo vs YTD - last 12 months",
+                velo_player.get("date", pd.Series(dtype="datetime64[ns]")),
+                velo_player.get("fb_velo", pd.Series(dtype=float)),
+                "mph", None,
+                velo_player.get("ytd_fb_velo", pd.Series(dtype=float)), "YTD",
+            )
+        )
+    elif is_position_player_position(position):
+        chart_defs.extend([
+            (
+                "Bat Speed - last 12 months",
+                monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
+                monthly_player.get("monthly_avg_bat_speed", pd.Series(dtype=float)),
+                "mph", row.get("bat_baseline"), None, None,
+            ),
+            (
+                "Sprint Speed - last 12 months",
+                monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
+                monthly_player.get("monthly_max_sprint_speed", pd.Series(dtype=float)),
+                "ft/s", row.get("sprint_baseline"), None, None,
+            ),
+        ])
+
+    charts_top = notes_bottom - 12
     chart_gap = 8
-    chart_h = 105
-    top_w = (page_w - 68 - chart_gap * 2) / 3
-    bottom_w = (page_w - 68 - chart_gap) / 2
+    n_charts = len(chart_defs)
+    # Keep enough room for a notes box on position-player reports, which use two chart rows.
+    chart_h = 84 if (str(report_notes or "").strip() and n_charts == 4) else 96 if str(report_notes or "").strip() else 105
+    n_cols = 3 if n_charts == 3 else 2
+    chart_w = (page_w - 68 - chart_gap * (n_cols - 1)) / n_cols
 
-    _pdf_draw_series_chart(
-        c, 34, charts_top - chart_h, top_w, chart_h,
-        "Bodyweight - last 12 months",
-        jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
-        jump_player.get("bodyweight_lb", pd.Series(dtype=float)),
-        "lb", row.get("bw_baseline_lb"),
-    )
-    _pdf_draw_series_chart(
-        c, 34 + top_w + chart_gap, charts_top - chart_h, top_w, chart_h,
-        "CI - last 12 months",
-        jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
-        jump_player.get("ci", pd.Series(dtype=float)),
-        "N s", row.get("ci_baseline"),
-    )
-    _pdf_draw_series_chart(
-        c, 34 + 2 * (top_w + chart_gap), charts_top - chart_h, top_w, chart_h,
-        "FB Velo vs YTD - last 12 months",
-        velo_player.get("date", pd.Series(dtype="datetime64[ns]")),
-        velo_player.get("fb_velo", pd.Series(dtype=float)),
-        "mph", None,
-        second_values=velo_player.get("ytd_fb_velo", pd.Series(dtype=float)),
-        second_label="YTD",
-    )
-
-    second_y = charts_top - chart_h - chart_gap - chart_h
-    _pdf_draw_series_chart(
-        c, 34, second_y, bottom_w, chart_h,
-        "Bat Speed - last 12 months",
-        monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
-        monthly_player.get("monthly_avg_bat_speed", pd.Series(dtype=float)),
-        "mph", row.get("bat_baseline"),
-    )
-    _pdf_draw_series_chart(
-        c, 34 + bottom_w + chart_gap, second_y, bottom_w, chart_h,
-        "Sprint Speed - last 12 months",
-        monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
-        monthly_player.get("monthly_max_sprint_speed", pd.Series(dtype=float)),
-        "ft/s", row.get("sprint_baseline"),
-    )
+    for idx, (title, dates, values, unit, baseline, second_values, second_label) in enumerate(chart_defs):
+        chart_row = idx // n_cols
+        chart_col = idx % n_cols
+        x = 34 + chart_col * (chart_w + chart_gap)
+        y = charts_top - chart_h - chart_row * (chart_h + chart_gap)
+        _pdf_draw_series_chart(
+            c, x, y, chart_w, chart_h,
+            title, dates, values, unit, baseline,
+            second_values=second_values,
+            second_label=second_label,
+        )
 
     c.setFillColor(HexColor(SUBTEXT))
     c.setFont("Helvetica", 6.7)
@@ -1855,11 +2025,16 @@ def generate_player_reports_zip(
     alerts_view: pd.DataFrame,
     bundle: SourceBundle,
     as_of_date,
+    notes_by_player: dict[str, str] | None = None,
 ) -> bytes:
     buffer = io.BytesIO()
+    notes_by_player = notes_by_player or {}
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for _, row in alerts_view.sort_values(["team", "athlete"], kind="stable").iterrows():
-            pdf_bytes = generate_player_report_pdf(row, bundle, as_of_date)
+            player_notes = notes_by_player.get(str(row.get("name_key", "")), "")
+            pdf_bytes = generate_player_report_pdf(
+                row, bundle, as_of_date, report_notes=player_notes
+            )
             team_part = safe_filename(str(row.get("team", "Unassigned")))
             player_part = safe_filename(str(row.get("athlete", "Player")))
             filename = f"{team_part}/{player_part}_nutrition_report.pdf"
@@ -2332,8 +2507,9 @@ with velo_tab:
         "A negative difference means current fastball velocity is running below the pitcher's YTD fastball velocity. "
         "Only declines trigger velocity alerts."
     )
+    pitcher_alerts = alerts[alerts["position"].map(is_pitcher_position).fillna(False)].copy()
     render_metric_tab(
-        alerts,
+        pitcher_alerts,
         title="FB Velo",
         level_col="velo_level",
         current_col="velo_current",
@@ -2356,8 +2532,9 @@ with bat_tab:
         "Compares the latest eligible monthly_avg_bat_speed value with the previous eligible month. "
         f"A month must contain at least {bat_min_days} distinct PP_Sprint data dates. Only declines trigger alerts."
     )
+    position_player_alerts = alerts[alerts["position"].map(is_position_player_position).fillna(False)].copy()
     render_metric_tab(
-        alerts,
+        position_player_alerts,
         title="Bat Speed",
         level_col="bat_level",
         current_col="bat_current",
@@ -2379,8 +2556,9 @@ with sprint_tab:
         f"A month must contain at least {sprint_min_days} distinct PP_Sprint data dates to avoid flagging an incomplete monthly maximum too early. "
         "Only declines trigger alerts."
     )
+    position_player_alerts = alerts[alerts["position"].map(is_position_player_position).fillna(False)].copy()
     render_metric_tab(
-        alerts,
+        position_player_alerts,
         title="Sprint Speed",
         level_col="sprint_level",
         current_col="sprint_current",
@@ -2410,22 +2588,6 @@ with hydration_tab:
         if bundle.hydration_status:
             st.caption(bundle.hydration_status)
     else:
-        tested = int(hydration_view["sodium_loss_mg_l"].notna().sum())
-        mean_sodium = hydration_view["sodium_loss_mg_l"].mean()
-        high_mask = hydration_view["classification"].isin(["High", "Very High", "Moderate/High"])
-        high_n = int(high_mask.sum())
-        rec_n = int(hydration_view["recommendation"].astype(str).str.strip().ne("").sum())
-
-        h1, h2, h3, h4 = st.columns(4)
-        with h1:
-            st.markdown(metric_card("Hydration results", f"{tested:,}", BLUE), unsafe_allow_html=True)
-        with h2:
-            st.markdown(metric_card("Mean sweat sodium", fmt(mean_sodium, 0, " mg/L"), TEAL), unsafe_allow_html=True)
-        with h3:
-            st.markdown(metric_card("High / very high", f"{high_n:,}", AMBER), unsafe_allow_html=True)
-        with h4:
-            st.markdown(metric_card("Recommendations", f"{rec_n:,}", GREEN), unsafe_allow_html=True)
-
         hydration_display = hydration_view[[
             "athlete", "team", "position", "sodium_loss_mg_l",
             "classification", "recommendation", "source_tab",
@@ -2478,7 +2640,14 @@ with player_tab:
         with p2:
             st.markdown(metric_card("Flagged metrics", str(int(row["flagged_metrics"])), BLUE), unsafe_allow_html=True)
         with p3:
-            st.markdown(metric_card("Comparisons available", f"{int(row['metrics_with_comparison'])}/5", TEAL), unsafe_allow_html=True)
+            st.markdown(
+                metric_card(
+                    "Comparisons available",
+                    f"{int(row['metrics_with_comparison'])}/{int(row.get('metrics_applicable', 2))}",
+                    TEAL,
+                ),
+                unsafe_allow_html=True,
+            )
         if row["Why flagged"] != "No threshold exceeded":
             st.warning(row["Why flagged"])
 
@@ -2519,32 +2688,34 @@ with player_tab:
                     use_container_width=True, config={"displayModeBar": False}, key=f"player_ci_{key}",
                 )
 
-        a, b = st.columns(2)
-        with a:
+        position = row.get("position", "")
+        if is_pitcher_position(position):
             with st.container(border=True):
                 st.subheader("FB Velo", anchor=False)
                 st.plotly_chart(
                     build_velo_time_series(velo_player),
                     use_container_width=True, config={"displayModeBar": False}, key=f"player_velo_{key}",
                 )
-        with b:
-            with st.container(border=True):
-                st.subheader("Bat Speed", anchor=False)
-                st.plotly_chart(
-                    build_time_series(
-                        monthly_player, "as_of_date", "monthly_avg_bat_speed", "Bat speed", "Monthly avg bat speed (mph)", row.get("bat_baseline")
-                    ),
-                    use_container_width=True, config={"displayModeBar": False}, key=f"player_bat_{key}",
-                )
-
-        with st.container(border=True):
-            st.subheader("Sprint Speed", anchor=False)
-            st.plotly_chart(
-                build_time_series(
-                    monthly_player, "as_of_date", "monthly_max_sprint_speed", "Sprint speed", "Monthly max sprint speed (ft/s)", row.get("sprint_baseline")
-                ),
-                use_container_width=True, config={"displayModeBar": False}, key=f"player_sprint_{key}",
-            )
+        elif is_position_player_position(position):
+            a, b = st.columns(2)
+            with a:
+                with st.container(border=True):
+                    st.subheader("Bat Speed", anchor=False)
+                    st.plotly_chart(
+                        build_time_series(
+                            monthly_player, "as_of_date", "monthly_avg_bat_speed", "Bat speed", "Monthly avg bat speed (mph)", row.get("bat_baseline")
+                        ),
+                        use_container_width=True, config={"displayModeBar": False}, key=f"player_bat_{key}",
+                    )
+            with b:
+                with st.container(border=True):
+                    st.subheader("Sprint Speed", anchor=False)
+                    st.plotly_chart(
+                        build_time_series(
+                            monthly_player, "as_of_date", "monthly_max_sprint_speed", "Sprint speed", "Monthly max sprint speed (ft/s)", row.get("sprint_baseline")
+                        ),
+                        use_container_width=True, config={"displayModeBar": False}, key=f"player_sprint_{key}",
+                    )
 
 
 # ----- PLAYER REPORTS -----
@@ -2552,7 +2723,7 @@ with report_tab:
     st.subheader("Individual Player Reports", anchor=False)
     st.caption(
         "Each PDF uses the same current thresholds, freshness rule, team filter, and as-of date as the dashboard. "
-        "The report includes the player's current review status, metric comparisons, sweat-sodium result when available, data age, and 12-month trends."
+        "The report includes the player's current review status, position-appropriate metric comparisons, the source-sheet sweat-test result when available, and 12-month trends."
     )
 
     report_players = alerts[["name_key", "athlete", "team", "position", "Status"]].copy()
@@ -2570,10 +2741,32 @@ with report_tab:
         )
         report_selected = report_players[report_players["label"] == selected_report_label].iloc[0]
         report_row = alerts[alerts["name_key"] == report_selected["name_key"]].iloc[0]
-        report_pdf = generate_player_report_pdf(report_row, bundle, as_of_date)
 
-        r1, r2, r3, r4 = st.columns(4)
-        with r1:
+        # Keep separate report notes for each player during the current app session.
+        notes_store = st.session_state.setdefault("player_report_notes", {})
+        report_name_key = str(report_row.get("name_key", ""))
+        report_notes = st.text_area(
+            "Report notes",
+            value=str(notes_store.get(report_name_key, "")),
+            height=110,
+            key=f"player_report_notes_input_{safe_filename(report_name_key)}",
+            placeholder="Type any context or follow-up notes to include on this player's PDF...",
+        )
+        notes_store[report_name_key] = report_notes
+
+        report_pdf = generate_player_report_pdf(
+            report_row, bundle, as_of_date, report_notes=report_notes
+        )
+
+        hydration_record = get_player_hydration(
+            bundle,
+            str(report_row.get("name_key", "")),
+            str(report_row.get("team", "") or ""),
+        )
+        hydration_summary = hydration_report_summary(hydration_record)
+
+        summary_cols = st.columns([1, 1, 2])
+        with summary_cols[0]:
             st.markdown(
                 metric_card(
                     "Status",
@@ -2582,12 +2775,16 @@ with report_tab:
                 ),
                 unsafe_allow_html=True,
             )
-        with r2:
-            st.markdown(metric_card("Flagged metrics", str(int(report_row["flagged_metrics"])), BLUE), unsafe_allow_html=True)
-        with r3:
-            st.markdown(metric_card("Fresh comparisons", f"{int(report_row['metrics_with_comparison'])}/5", TEAL), unsafe_allow_html=True)
-        with r4:
-            st.markdown(metric_card("Stale metrics", str(int(report_row["stale_metrics"])), SUBTEXT), unsafe_allow_html=True)
+        if hydration_summary is not None:
+            with summary_cols[1]:
+                st.markdown(
+                    metric_card(
+                        "Sweat Test",
+                        hydration_summary["value"],
+                        TEAL,
+                    ),
+                    unsafe_allow_html=True,
+                )
 
         st.download_button(
             "Download selected player PDF",
@@ -2605,15 +2802,26 @@ with report_tab:
             f"Creates one separate PDF for every player in the current view ({len(alerts):,} players) and packages them into a ZIP, organized by team."
         )
 
+        notes_store = st.session_state.get("player_report_notes", {})
+        current_name_keys = set(alerts["name_key"].astype(str))
+        notes_signature = tuple(
+            sorted(
+                (str(k), str(v))
+                for k, v in notes_store.items()
+                if str(k) in current_name_keys and str(v).strip()
+            )
+        )
         batch_signature = (
             str(as_of_date), team_filter, recent_days, baseline_days, bat_min_days, sprint_min_days,
             bw_direction, bw_monitor_pct, bw_review_pct, ci_monitor_pct, ci_review_pct,
             velo_monitor_mph, velo_review_mph, bat_monitor_mph, bat_review_mph,
-            sprint_monitor, sprint_review, escalate_multi,
+            sprint_monitor, sprint_review, escalate_multi, notes_signature,
         )
         if st.button("Build ZIP of all player reports", key="build_player_report_zip", use_container_width=True):
             with st.spinner("Building player reports..."):
-                st.session_state["player_report_zip_bytes"] = generate_player_reports_zip(alerts, bundle, as_of_date)
+                st.session_state["player_report_zip_bytes"] = generate_player_reports_zip(
+                    alerts, bundle, as_of_date, notes_by_player=notes_store
+                )
                 st.session_state["player_report_zip_signature"] = batch_signature
 
         if (
