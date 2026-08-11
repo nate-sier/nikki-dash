@@ -26,6 +26,7 @@ DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_PERFORMANCE_TAB = "PP_Sprint"
 DEFAULT_ROSTER_TAB = "Master Roster"
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
+MAX_FLAG_AGE_DAYS = 30
 
 KNOWN_TEAM_ALIASES = {
     "DSL": "DSL",
@@ -886,6 +887,25 @@ def build_alert_table(
         lambda x: decline_flag_level(x, thresholds.sprint_monitor, thresholds.sprint_review)
     )
 
+    # Freshness rule: an observation more than 30 days old can still be shown
+    # historically, but it cannot generate a Monitor/Review flag. Freshness is
+    # evaluated relative to the selected dashboard as-of date.
+    as_of = pd.Timestamp(as_of_date).normalize()
+    freshness_map = {
+        "bw": ("bw_current_date", "bw_level"),
+        "ci": ("ci_current_date", "ci_level"),
+        "velo": ("velo_current_date", "velo_level"),
+        "bat": ("bat_current_date", "bat_level"),
+        "sprint": ("sprint_current_date", "sprint_level"),
+    }
+    for prefix, (date_col, level_col) in freshness_map.items():
+        current_dates = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
+        age_col = f"{prefix}_data_age_days"
+        stale_col = f"{prefix}_stale"
+        out[age_col] = (as_of - current_dates).dt.days
+        out[stale_col] = current_dates.notna() & (out[age_col] > MAX_FLAG_AGE_DAYS)
+        out.loc[out[stale_col], level_col] = 0
+
     level_cols = ["bw_level", "ci_level", "velo_level", "bat_level", "sprint_level"]
     out["flagged_metrics"] = (out[level_cols] > 0).sum(axis=1)
     out["review_metrics"] = (out[level_cols] == 2).sum(axis=1)
@@ -912,9 +932,22 @@ def build_alert_table(
 
     out["Why flagged"] = out.apply(reasons, axis=1)
 
-    # How much usable comparison data exists for each athlete.
-    comparison_cols = ["bw_change_pct", "ci_change_pct", "velo_change", "bat_change", "sprint_change"]
-    out["metrics_with_comparison"] = out[comparison_cols].notna().sum(axis=1)
+    # How much fresh, usable comparison data exists for each athlete. Stale
+    # comparisons remain visible in detail/history but are not counted as current.
+    comparison_map = {
+        "bw": "bw_change_pct",
+        "ci": "ci_change_pct",
+        "velo": "velo_change",
+        "bat": "bat_change",
+        "sprint": "sprint_change",
+    }
+    fresh_comparisons = pd.DataFrame(index=out.index)
+    for prefix, comparison_col in comparison_map.items():
+        fresh_comparisons[prefix] = (
+            out[comparison_col].notna() & ~out[f"{prefix}_stale"].fillna(False)
+        )
+    out["metrics_with_comparison"] = fresh_comparisons.sum(axis=1)
+    out["stale_metrics"] = out[[f"{p}_stale" for p in comparison_map]].sum(axis=1)
 
     status_order = {"Review": 0, "Monitor": 1, "Stable": 2}
     out["_status_order"] = out["Status"].map(status_order).fillna(3)
@@ -1322,7 +1355,7 @@ with c4:
 st.caption(
     f"As of {fmt_date(as_of_date)} · BW/CI recent {recent_days}d vs prior {baseline_days}d · "
     f"FB velo = current fb_velo vs same-row YTD · Bat minimum {bat_min_days} dates/month · "
-    f"Sprint minimum {sprint_min_days} dates/month"
+    f"Sprint minimum {sprint_min_days} dates/month · Data >{MAX_FLAG_AGE_DAYS} days old cannot flag"
 )
 
 (
@@ -1449,7 +1482,14 @@ def render_metric_tab(
     current_label: str = "Current",
     baseline_label: str = "Baseline",
 ):
-    valid = data[data[change_col].notna()].copy()
+    metric_prefix = level_col.removesuffix("_level")
+    stale_col = f"{metric_prefix}_stale"
+    fresh_mask = (
+        ~data[stale_col].fillna(False)
+        if stale_col in data.columns
+        else pd.Series(True, index=data.index)
+    )
+    valid = data[data[change_col].notna() & fresh_mask].copy()
     flags = valid[valid[level_col] > 0].copy()
     median_change = valid[change_col].median() if not valid.empty else np.nan
 
@@ -1467,7 +1507,7 @@ def render_metric_tab(
             st.subheader(f"Largest {title} Changes", anchor=False)
             st.plotly_chart(
                 build_metric_change_bar(
-                    data,
+                    valid,
                     change_pct_col if pct_bar and change_pct_col else change_col,
                     change_bar_title,
                     "%" if pct_bar else unit,
@@ -1488,6 +1528,15 @@ def render_metric_tab(
             if change_pct_col:
                 cols.insert(6, change_pct_col)
             detail = data[cols].copy()
+            current_dates_raw = pd.to_datetime(detail[current_date_col], errors="coerce")
+            if stale_col in data.columns:
+                detail["Data Status"] = np.where(
+                    current_dates_raw.isna(),
+                    "No current data",
+                    np.where(data.loc[detail.index, stale_col].fillna(False), f"Stale >{MAX_FLAG_AGE_DAYS}d", "Current"),
+                )
+            else:
+                detail["Data Status"] = np.where(current_dates_raw.isna(), "No current data", "Current")
             rename = {
                 "athlete": "Player",
                 "team": "Team",
@@ -1739,32 +1788,32 @@ with player_tab:
 with data_tab:
     st.subheader("Data Coverage", anchor=False)
     st.caption(
-        "This separates 'no alert' from 'not enough data to make the comparison.' It is useful for finding monitoring gaps before they hide a change."
+        f"This separates 'no alert' from 'not enough fresh data to make the comparison.' Any metric whose latest observation is more than {MAX_FLAG_AGE_DAYS} days old is stale and cannot generate an alert."
     )
     coverage = alerts[[
-        "athlete", "team", "position", "Status", "metrics_with_comparison",
+        "athlete", "team", "position", "Status", "metrics_with_comparison", "stale_metrics",
         "bw_current_date", "ci_current_date", "velo_current_date",
         "bat_current_date", "sprint_current_date",
     ]].copy()
     coverage.columns = [
-        "Player", "Team", "Position", "Status", "Comparable Metrics",
+        "Player", "Team", "Position", "Status", "Fresh Comparable Metrics", "Stale Metrics",
         "Last BW", "Last CI", "Last FB Velo", "Last Bat Speed", "Last Sprint Speed",
     ]
     for c in ["Last BW", "Last CI", "Last FB Velo", "Last Bat Speed", "Last Sprint Speed"]:
         coverage[c] = coverage[c].map(fmt_date)
-    coverage = coverage.sort_values(["Comparable Metrics", "Team", "Player"])
+    coverage = coverage.sort_values(["Fresh Comparable Metrics", "Stale Metrics", "Team", "Player"])
     st.dataframe(coverage, hide_index=True, use_container_width=True, height=650)
     csv_download_button(coverage, "Download data coverage CSV", "nutrition_data_coverage.csv", "coverage_csv")
 
     missing_counts = {
-        "Bodyweight": int(alerts["bw_change_pct"].isna().sum()),
-        "CI": int(alerts["ci_change_pct"].isna().sum()),
-        "FB Velo": int(alerts["velo_change"].isna().sum()),
-        "Bat Speed": int(alerts["bat_change"].isna().sum()),
-        "Sprint Speed": int(alerts["sprint_change"].isna().sum()),
+        "Bodyweight": int((alerts["bw_change_pct"].isna() | alerts["bw_stale"]).sum()),
+        "CI": int((alerts["ci_change_pct"].isna() | alerts["ci_stale"]).sum()),
+        "FB Velo": int((alerts["velo_change"].isna() | alerts["velo_stale"]).sum()),
+        "Bat Speed": int((alerts["bat_change"].isna() | alerts["bat_stale"]).sum()),
+        "Sprint Speed": int((alerts["sprint_change"].isna() | alerts["sprint_stale"]).sum()),
     }
     st.markdown(
-        "**Players without a valid comparison:** "
+        f"**Players without a fresh valid comparison (missing or >{MAX_FLAG_AGE_DAYS} days old):** "
         + " · ".join(f"{k}: {v}" for k, v in missing_counts.items())
     )
 
