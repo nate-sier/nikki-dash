@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import html
 import hmac
+import io
 import os
 import re
 import unicodedata
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.pdfgen import canvas as pdf_canvas
 
 
 # -----------------------------------------------------------------------------
@@ -25,6 +30,15 @@ DEFAULT_JUMP_TAB = "Jump Data"
 DEFAULT_VELO_TAB = "FB Velo"
 DEFAULT_PERFORMANCE_TAB = "PP_Sprint"
 DEFAULT_ROSTER_TAB = "Master Roster"
+DEFAULT_HYDRATION_SHEET_ID = "15SQ2MBobXTP5kgR40l1E1e43C1pviT0Wd_3zIuG0Deg"
+DEFAULT_DSL_HYDRATION_TAB = "DSL"
+HYDRATION_TAB_TEAM_MAP = {
+    "AAA": "Rochester",
+    "AA": "Harrisburg",
+    "A+": "Wilmington",
+    "A": "Fredericksburg",
+    "FCL+Rehab": None,
+}
 LOCAL_SERVICE_ACCOUNT_FILE = Path.home() / "Desktop" / "service_account.json"
 MAX_FLAG_AGE_DAYS = 30
 
@@ -215,6 +229,112 @@ def normalize_team(value) -> str | None:
     return KNOWN_TEAM_ALIASES.get(key)
 
 
+def clean_hydration_player_name(value) -> str:
+    """Normalize display names from hydration sheets without changing ordinary names."""
+    if pd.isna(value):
+        return ""
+    name = str(value).strip()
+    # DR sheet can contain labels such as "2027- Hendrick Barrios".
+    name = re.sub(r"^\s*20\d{2}\s*[-–—:]\s*", "", name)
+    return name.strip()
+
+
+def hydration_classification(value) -> str:
+    text = str(value or "").strip().lower().replace("-", " ")
+    if not text:
+        return ""
+    if "very high" in text:
+        return "Very High"
+    if ("moderate/high" in text) or ("moderate high" in text):
+        return "Moderate/High"
+    if "high" in text:
+        return "High"
+    if "moderate" in text:
+        return "Moderate"
+    if "low" in text:
+        return "Low"
+    return ""
+
+
+def parse_hydration_values(
+    values: list[list[str]],
+    source_tab: str,
+    source_team: str | None,
+    source_book: str,
+) -> pd.DataFrame:
+    """Parse the Player / Sodium Loss(or Results) / Recommendation sheet layout."""
+    columns = [
+        "name_key", "athlete", "source_team", "source_tab", "source_book",
+        "sodium_loss_mg_l", "classification", "result_raw", "recommendation",
+    ]
+    if not values:
+        return pd.DataFrame(columns=columns)
+
+    # The supplied workbooks have a blank first row, so find the real header row.
+    header_idx = None
+    for idx, row in enumerate(values[:15]):
+        first = str(row[0]).strip().lower() if row else ""
+        if first in {"player", "athlete", "name"}:
+            header_idx = idx
+            break
+    if header_idx is None:
+        return pd.DataFrame(columns=columns)
+
+    headers = [str(x).strip() for x in values[header_idx]]
+    name_idx = next((i for i, h in enumerate(headers) if h.lower() in {"player", "athlete", "name"}), 0)
+    result_idx = next(
+        (i for i, h in enumerate(headers) if h.lower() in {"sodium loss", "results", "result"}),
+        1 if len(headers) > 1 else None,
+    )
+    recommendation_idx = next(
+        (i for i, h in enumerate(headers) if h.lower() == "recommendation"),
+        2 if len(headers) > 2 else None,
+    )
+    if result_idx is None:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for row in values[header_idx + 1:]:
+        if not row:
+            continue
+        athlete = clean_hydration_player_name(row[name_idx] if name_idx < len(row) else "")
+        if not athlete:
+            continue
+        result_raw = str(row[result_idx]).strip() if result_idx < len(row) else ""
+        recommendation = (
+            str(row[recommendation_idx]).strip()
+            if recommendation_idx is not None and recommendation_idx < len(row)
+            else ""
+        )
+        match = re.search(r"(?i)(\d{2,4}(?:\.\d+)?)\s*mg\s*/\s*l", result_raw)
+        sodium_loss = float(match.group(1)) if match else np.nan
+        rows.append({
+            "athlete": athlete,
+            "name_key": canonical_name(athlete),
+            "source_team": source_team,
+            "source_tab": source_tab,
+            "source_book": source_book,
+            "sodium_loss_mg_l": sodium_loss,
+            "classification": hydration_classification(result_raw),
+            "result_raw": result_raw,
+            "recommendation": recommendation,
+        })
+
+    out = pd.DataFrame(rows, columns=columns)
+    if out.empty:
+        return out
+    out = out[(out["athlete"] != "") & (out["name_key"] != "")].copy()
+    # Prefer rows with an actual numeric test result if duplicate names exist.
+    out["_has_result"] = out["sodium_loss_mg_l"].notna().astype(int)
+    out = (
+        out.sort_values(["name_key", "_has_result"], kind="stable")
+        .drop_duplicates(["name_key", "source_tab"], keep="last")
+        .drop(columns=["_has_result"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
 def fmt(value, digits=1, suffix="") -> str:
     if value is None or pd.isna(value) or not np.isfinite(float(value)):
         return "—"
@@ -315,12 +435,27 @@ def read_tab_optional(client: gspread.Client, sheet_id: str, tab_name: str) -> p
         return pd.DataFrame()
 
 
+def read_tab_values_optional(
+    client: gspread.Client,
+    sheet_id: str,
+    tab_name: str,
+) -> tuple[list[list[str]], str | None]:
+    """Read raw cell values so hydration sheets can have a blank row above their headers."""
+    try:
+        worksheet = client.open_by_key(sheet_id).worksheet(tab_name)
+        return worksheet.get_all_values(), None
+    except Exception as exc:
+        return [], f"{tab_name}: {exc}"
+
+
 @dataclass
 class SourceBundle:
     jump: pd.DataFrame
     velo: pd.DataFrame
     monthly: pd.DataFrame
     roster: pd.DataFrame
+    hydration: pd.DataFrame
+    hydration_status: str
     status: str
     bw_source_col: str
 
@@ -336,6 +471,12 @@ def load_source_data() -> SourceBundle:
         secret_or_default("BAT_TAB", DEFAULT_PERFORMANCE_TAB),
     )
     roster_tab = secret_or_default("ROSTER_TAB", DEFAULT_ROSTER_TAB)
+    hydration_sheet_id = secret_or_default(
+        "HYDRATION_SHEET_ID", DEFAULT_HYDRATION_SHEET_ID
+    )
+    dsl_hydration_tab = secret_or_default(
+        "DSL_HYDRATION_TAB", DEFAULT_DSL_HYDRATION_TAB
+    )
 
     creds = get_credentials()
     client = gspread.authorize(creds)
@@ -551,10 +692,75 @@ def load_source_data() -> SourceBundle:
             roster = roster[(roster["athlete"] != "") & (roster["name_key"] != "")]
             roster = roster.drop_duplicates("name_key", keep="last")[["name_key", "athlete", "team", "position"]]
 
+    # ----- Hydration / sweat sodium -----
+    # External Hydration spreadsheet contains AAA, AA, A+, A, and FCL+Rehab.
+    # The primary reporting spreadsheet contains the DR results on the DSL tab.
+    hydration_frames = []
+    hydration_errors = []
+    for hydration_tab_name, hydration_team in HYDRATION_TAB_TEAM_MAP.items():
+        values, error = read_tab_values_optional(
+            client, hydration_sheet_id, hydration_tab_name
+        )
+        if error:
+            hydration_errors.append(error)
+            continue
+        parsed = parse_hydration_values(
+            values,
+            source_tab=hydration_tab_name,
+            source_team=hydration_team,
+            source_book="Hydration",
+        )
+        if not parsed.empty:
+            hydration_frames.append(parsed)
+
+    dsl_values, dsl_error = read_tab_values_optional(
+        client, sheet_id, dsl_hydration_tab
+    )
+    if dsl_error:
+        hydration_errors.append(f"Primary {dsl_error}")
+    else:
+        dsl_parsed = parse_hydration_values(
+            dsl_values,
+            source_tab=dsl_hydration_tab,
+            source_team="DSL",
+            source_book="Primary reports",
+        )
+        if not dsl_parsed.empty:
+            hydration_frames.append(dsl_parsed)
+
+    hydration_columns = [
+        "name_key", "athlete", "source_team", "source_tab", "source_book",
+        "sodium_loss_mg_l", "classification", "result_raw", "recommendation",
+    ]
+    hydration = (
+        pd.concat(hydration_frames, ignore_index=True)
+        if hydration_frames
+        else pd.DataFrame(columns=hydration_columns)
+    )
+    if not hydration.empty:
+        # One result per player is expected in the supplied structure. Prefer a numeric result
+        # while retaining the source tab and full recommendation.
+        hydration["_has_result"] = hydration["sodium_loss_mg_l"].notna().astype(int)
+        hydration = (
+            hydration.sort_values(["name_key", "_has_result"], kind="stable")
+            .drop_duplicates("name_key", keep="last")
+            .drop(columns=["_has_result"])
+            .reset_index(drop=True)
+        )
+
+    if hydration_errors:
+        hydration_status = (
+            f"Loaded {len(hydration):,} hydration rows; some tabs were unavailable: "
+            + " | ".join(hydration_errors[:3])
+        )
+    else:
+        hydration_status = f"Loaded {len(hydration):,} hydration rows"
+
     status = (
         f"Loaded {len(jump):,} Jump Data rows, {len(velo):,} FB Velo rows, "
         f"{len(monthly):,} player-month PP_Sprint rows"
-        + (f", and {len(roster):,} roster rows" if not roster.empty else "")
+        + (f", {len(roster):,} roster rows" if not roster.empty else "")
+        + f", {len(hydration):,} hydration rows"
         + f" · {datetime.now().strftime('%I:%M %p').lstrip('0')}"
     )
     return SourceBundle(
@@ -562,6 +768,8 @@ def load_source_data() -> SourceBundle:
         velo=velo,
         monthly=monthly,
         roster=roster,
+        hydration=hydration,
+        hydration_status=hydration_status,
         status=status,
         bw_source_col=str(jump_bw_col),
     )
@@ -636,6 +844,62 @@ def build_player_directory(bundle: SourceBundle, as_of_date) -> pd.DataFrame:
     directory["position"] = directory.get("position", "").fillna("")
     directory = directory[directory["team"].isin(TEAM_ORDER)].copy()
     return directory.drop_duplicates("name_key", keep="last").reset_index(drop=True)
+
+
+def build_hydration_view(
+    bundle: SourceBundle,
+    directory: pd.DataFrame,
+    team_filter: str = "Full Organization",
+) -> pd.DataFrame:
+    """Resolve hydration records to the player's current dashboard team when possible."""
+    columns = [
+        "name_key", "athlete", "team", "position", "sodium_loss_mg_l",
+        "classification", "result_raw", "recommendation", "source_tab", "source_book",
+    ]
+    if bundle.hydration.empty:
+        return pd.DataFrame(columns=columns)
+
+    hydration = bundle.hydration.copy()
+    current = directory[["name_key", "athlete", "team", "position"]].drop_duplicates("name_key")
+    view = hydration.merge(
+        current,
+        on="name_key",
+        how="left",
+        suffixes=("_hydration", ""),
+    )
+    view["athlete"] = view["athlete"].combine_first(view["athlete_hydration"])
+    view["team"] = view["team"].combine_first(view["source_team"])
+    view["position"] = view["position"].fillna("")
+    view = view.drop(
+        columns=[c for c in ["athlete_hydration", "source_team"] if c in view.columns]
+    )
+
+    if team_filter != "Full Organization":
+        view = view[view["team"] == team_filter].copy()
+
+    keep = [c for c in columns if c in view.columns]
+    return view[keep].sort_values(["team", "athlete"], kind="stable").reset_index(drop=True)
+
+
+def get_player_hydration(
+    bundle: SourceBundle,
+    name_key: str,
+    current_team: str | None = None,
+) -> pd.Series | None:
+    """Return the best hydration row for one player, preferring the current-team source."""
+    if bundle.hydration.empty:
+        return None
+    rows = bundle.hydration[bundle.hydration["name_key"] == name_key].copy()
+    if rows.empty:
+        return None
+    if current_team:
+        same_team = rows[rows["source_team"] == current_team]
+        if not same_team.empty:
+            rows = same_team
+    with_numeric = rows[rows["sodium_loss_mg_l"].notna()]
+    if not with_numeric.empty:
+        rows = with_numeric
+    return rows.iloc[-1]
 
 
 # -----------------------------------------------------------------------------
@@ -1166,6 +1430,440 @@ def build_velo_time_series(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+
+# -----------------------------------------------------------------------------
+# INDIVIDUAL PLAYER PDF REPORTS
+# -----------------------------------------------------------------------------
+def safe_filename(value: str) -> str:
+    value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    return value.strip("_") or "player"
+
+
+def _report_metric_status(row: pd.Series, prefix: str, comparison_col: str) -> str:
+    if bool(row.get(f"{prefix}_stale", False)):
+        return f"Stale >{MAX_FLAG_AGE_DAYS}d"
+    if pd.isna(row.get(comparison_col, np.nan)):
+        return "No comparison"
+    return level_label(int(row.get(f"{prefix}_level", 0)))
+
+
+def _report_status_color(status: str):
+    if status == "Review":
+        return HexColor(ACCENT_RED)
+    if status == "Monitor":
+        return HexColor(AMBER)
+    if status.startswith("Stale") or status == "No comparison":
+        return HexColor(SUBTEXT)
+    return HexColor(GREEN)
+
+
+def _pdf_draw_metric_table(
+    c,
+    row: pd.Series,
+    x: float,
+    y_top: float,
+    width: float,
+    hydration_record: pd.Series | None = None,
+) -> float:
+    rows = [
+        (
+            "Bodyweight",
+            fmt(row.get("bw_current_lb"), 1, " lb"),
+            fmt(row.get("bw_baseline_lb"), 1, " lb"),
+            f"{fmt_signed(row.get('bw_change_lb'), 1, ' lb')} / {fmt_signed(row.get('bw_change_pct'), 1, '%')}",
+            _report_metric_status(row, "bw", "bw_change_pct"),
+            row.get("bw_data_age_days"),
+        ),
+        (
+            "CI",
+            fmt(row.get("ci_current"), 1, " N s"),
+            fmt(row.get("ci_baseline"), 1, " N s"),
+            fmt_signed(row.get("ci_change_pct"), 1, "%"),
+            _report_metric_status(row, "ci", "ci_change_pct"),
+            row.get("ci_data_age_days"),
+        ),
+        (
+            "FB Velo",
+            fmt(row.get("velo_current"), 2, " mph"),
+            fmt(row.get("velo_baseline"), 2, " mph"),
+            fmt_signed(row.get("velo_change"), 2, " mph"),
+            _report_metric_status(row, "velo", "velo_change"),
+            row.get("velo_data_age_days"),
+        ),
+        (
+            "Bat Speed",
+            fmt(row.get("bat_current"), 2, " mph"),
+            fmt(row.get("bat_baseline"), 2, " mph"),
+            fmt_signed(row.get("bat_change"), 2, " mph"),
+            _report_metric_status(row, "bat", "bat_change"),
+            row.get("bat_data_age_days"),
+        ),
+        (
+            "Sprint Speed",
+            fmt(row.get("sprint_current"), 2, " ft/s"),
+            fmt(row.get("sprint_baseline"), 2, " ft/s"),
+            fmt_signed(row.get("sprint_change"), 2, " ft/s"),
+            _report_metric_status(row, "sprint", "sprint_change"),
+            row.get("sprint_data_age_days"),
+        ),
+    ]
+
+    if hydration_record is not None:
+        hydration_value = hydration_record.get("sodium_loss_mg_l", np.nan)
+        hydration_current = (
+            fmt(hydration_value, 0, " mg/L")
+            if pd.notna(hydration_value)
+            else "Result available"
+        )
+        hydration_status = str(hydration_record.get("classification", "") or "Hydration test")
+        rows.append(
+            (
+                "Sweat Sodium",
+                hydration_current,
+                "—",
+                "—",
+                hydration_status,
+                "—",
+            )
+        )
+    else:
+        rows.append(("Sweat Sodium", "—", "—", "—", "No result", "—"))
+
+    headers = ["Metric", "Current", "Comparison", "Change", "Status", "Age"]
+    fractions = [0.17, 0.18, 0.18, 0.20, 0.18, 0.09]
+    col_widths = [width * f for f in fractions]
+    row_h = 22
+
+    c.setFillColor(HexColor(NAVY))
+    c.roundRect(x, y_top - row_h, width, row_h, 5, fill=1, stroke=0)
+    c.setFillColor(HexColor("#FFFFFF"))
+    c.setFont("Helvetica-Bold", 8.2)
+    cx = x
+    for header, cw in zip(headers, col_widths):
+        c.drawString(cx + 5, y_top - 14.5, header)
+        cx += cw
+
+    y = y_top - row_h
+    for i, values in enumerate(rows):
+        y -= row_h
+        c.setFillColor(HexColor("#F8FAFC") if i % 2 == 0 else HexColor("#FFFFFF"))
+        c.rect(x, y, width, row_h, fill=1, stroke=0)
+        c.setStrokeColor(HexColor(BORDER))
+        c.line(x, y, x + width, y)
+        cx = x
+        for j, (value, cw) in enumerate(zip(values, col_widths)):
+            if j == 4:
+                c.setFillColor(_report_status_color(str(value)))
+                c.setFont("Helvetica-Bold", 7.8)
+            else:
+                c.setFillColor(HexColor(TEXT))
+                c.setFont("Helvetica", 7.8)
+            text = "-" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+            if j == 5:
+                if pd.isna(value):
+                    text = "-"
+                else:
+                    text = f"{int(value)}d"
+            max_chars = max(6, int(cw / 4.5))
+            if len(text) > max_chars:
+                text = text[: max_chars - 1] + "..."
+            c.drawString(cx + 5, y + 7.2, text)
+            cx += cw
+    return y
+
+
+def _pdf_draw_series_chart(
+    c,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    title: str,
+    dates,
+    values,
+    unit: str,
+    baseline=None,
+    second_values=None,
+    second_label: str | None = None,
+) -> None:
+    c.setStrokeColor(HexColor(BORDER))
+    c.setFillColor(HexColor("#FFFFFF"))
+    c.roundRect(x, y, w, h, 7, fill=1, stroke=1)
+    c.setFillColor(HexColor(NAVY))
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(x + 8, y + h - 14, title)
+
+    plot_x = x + 30
+    plot_y = y + 20
+    plot_w = max(20, w - 42)
+    plot_h = max(20, h - 42)
+
+    d = pd.to_datetime(pd.Series(dates), errors="coerce")
+    v = pd.to_numeric(pd.Series(values), errors="coerce")
+    valid = d.notna() & v.notna()
+    d = d[valid].reset_index(drop=True)
+    v = v[valid].reset_index(drop=True)
+
+    second = None
+    if second_values is not None:
+        second_all = pd.to_numeric(pd.Series(second_values), errors="coerce")
+        second = second_all[valid].reset_index(drop=True)
+
+    if len(v) == 0:
+        c.setFillColor(HexColor(SUBTEXT))
+        c.setFont("Helvetica", 8)
+        c.drawCentredString(x + w / 2, y + h / 2, "No data")
+        return
+
+    all_vals = v.tolist()
+    if second is not None:
+        all_vals += second.dropna().tolist()
+    if baseline is not None and not pd.isna(baseline):
+        all_vals.append(float(baseline))
+    vmin = float(np.nanmin(all_vals))
+    vmax = float(np.nanmax(all_vals))
+    if np.isclose(vmin, vmax):
+        pad = max(abs(vmin) * 0.02, 0.5)
+    else:
+        pad = (vmax - vmin) * 0.12
+    ymin = vmin - pad
+    ymax = vmax + pad
+
+    if len(d) == 1 or d.max() == d.min():
+        xs = np.array([plot_x + plot_w / 2] * len(d), dtype=float)
+    else:
+        span = (d.max() - d.min()).total_seconds()
+        xs = np.array([
+            plot_x + ((dt - d.min()).total_seconds() / span) * plot_w for dt in d
+        ])
+
+    def ymap(val):
+        return plot_y + ((float(val) - ymin) / max(ymax - ymin, 1e-9)) * plot_h
+
+    c.setStrokeColor(HexColor(GRID))
+    c.setLineWidth(0.5)
+    for frac in [0.0, 0.5, 1.0]:
+        yy = plot_y + frac * plot_h
+        c.line(plot_x, yy, plot_x + plot_w, yy)
+
+    if baseline is not None and not pd.isna(baseline):
+        c.saveState()
+        c.setDash(3, 2)
+        c.setStrokeColor(HexColor(TEAL))
+        c.setLineWidth(1)
+        yy = ymap(float(baseline))
+        c.line(plot_x, yy, plot_x + plot_w, yy)
+        c.restoreState()
+
+    def draw_line(vals, color, line_width=1.6):
+        points = [(float(xx), ymap(val)) for xx, val in zip(xs, vals) if not pd.isna(val)]
+        if not points:
+            return
+        c.setStrokeColor(HexColor(color))
+        c.setFillColor(HexColor(color))
+        c.setLineWidth(line_width)
+        if len(points) > 1:
+            path = c.beginPath()
+            path.moveTo(points[0][0], points[0][1])
+            for px, py in points[1:]:
+                path.lineTo(px, py)
+            c.drawPath(path, stroke=1, fill=0)
+        for px, py in points[-12:]:
+            c.circle(px, py, 1.6, fill=1, stroke=0)
+
+    draw_line(v, BLUE)
+    if second is not None:
+        draw_line(second, NAVY_MID, 1.2)
+
+    c.setFillColor(HexColor(SUBTEXT))
+    c.setFont("Helvetica", 6.5)
+    c.drawRightString(plot_x - 3, plot_y + plot_h - 2, f"{vmax:.1f}")
+    c.drawRightString(plot_x - 3, plot_y - 1, f"{vmin:.1f}")
+    if len(d):
+        c.drawString(plot_x, y + 6, d.min().strftime("%b %Y"))
+        c.drawRightString(plot_x + plot_w, y + 6, d.max().strftime("%b %Y"))
+    c.setFillColor(HexColor(TEXT))
+    c.setFont("Helvetica-Bold", 7)
+    c.drawRightString(x + w - 8, y + h - 14, f"{v.iloc[-1]:.2f} {unit}")
+    if second is not None and second_label and len(second.dropna()):
+        c.setFillColor(HexColor(SUBTEXT))
+        c.setFont("Helvetica", 6.5)
+        c.drawRightString(x + w - 8, y + h - 24, f"{second_label}: {second.dropna().iloc[-1]:.2f}")
+
+
+def generate_player_report_pdf(
+    row: pd.Series,
+    bundle: SourceBundle,
+    as_of_date,
+) -> bytes:
+    buffer = io.BytesIO()
+    page_w, page_h = landscape(letter)
+    c = pdf_canvas.Canvas(buffer, pagesize=(page_w, page_h))
+    c.setTitle(f"Nutrition Early Warning - {row.get('athlete', 'Player')}")
+
+    # Header
+    c.setFillColor(HexColor(NAVY))
+    c.rect(0, page_h - 70, page_w, 70, fill=1, stroke=0)
+    c.setFillColor(HexColor("#FFFFFF"))
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(34, page_h - 31, "Nutrition Early Warning - Player Report")
+    c.setFont("Helvetica", 9)
+    c.drawString(34, page_h - 49, f"As of {fmt_date(as_of_date)}")
+
+    athlete = str(row.get("athlete", "Player"))
+    team = str(row.get("team", ""))
+    position = str(row.get("position", "") or "")
+    c.setFont("Helvetica-Bold", 17)
+    c.drawRightString(page_w - 34, page_h - 31, athlete)
+    c.setFont("Helvetica", 9)
+    subtitle = team + (f" | {position}" if position else "")
+    c.drawRightString(page_w - 34, page_h - 49, subtitle)
+
+    # Summary cards
+    card_y = page_h - 124
+    card_h = 38
+    card_gap = 8
+    card_w = (page_w - 68 - card_gap * 3) / 4
+    cards = [
+        ("Overall Status", str(row.get("Status", "Stable")), _report_status_color(str(row.get("Status", "Stable")))),
+        ("Flagged Metrics", str(int(row.get("flagged_metrics", 0))), HexColor(BLUE)),
+        ("Fresh Comparisons", f"{int(row.get('metrics_with_comparison', 0))}/5", HexColor(TEAL)),
+        ("Stale Metrics", str(int(row.get("stale_metrics", 0))), HexColor(SUBTEXT)),
+    ]
+    for i, (label, value, color) in enumerate(cards):
+        xx = 34 + i * (card_w + card_gap)
+        c.setFillColor(HexColor("#FFFFFF"))
+        c.setStrokeColor(HexColor(BORDER))
+        c.roundRect(xx, card_y, card_w, card_h, 6, fill=1, stroke=1)
+        c.setFillColor(HexColor(SUBTEXT))
+        c.setFont("Helvetica-Bold", 6.8)
+        c.drawString(xx + 8, card_y + 25, label.upper())
+        c.setFillColor(color)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(xx + 8, card_y + 8, value)
+
+    # Flag reason / review cue
+    reason = str(row.get("Why flagged", "No threshold exceeded"))
+    c.setFillColor(HexColor("#FFF8E8") if row.get("Status") == "Monitor" else HexColor("#FFF1F3") if row.get("Status") == "Review" else HexColor("#F8FAFC"))
+    c.setStrokeColor(_report_status_color(str(row.get("Status", "Stable"))))
+    c.roundRect(34, page_h - 165, page_w - 68, 27, 6, fill=1, stroke=1)
+    c.setFillColor(HexColor(TEXT))
+    c.setFont("Helvetica-Bold", 8)
+    cue = "Review cue: " + reason
+    if len(cue) > 150:
+        cue = cue[:147] + "..."
+    c.drawString(43, page_h - 154, cue)
+
+    # Metric summary table, including the player's sweat-sodium result when available.
+    hydration_record = get_player_hydration(
+        bundle,
+        str(row.get("name_key", "")),
+        str(row.get("team", "") or ""),
+    )
+    table_bottom = _pdf_draw_metric_table(
+        c,
+        row,
+        34,
+        page_h - 184,
+        page_w - 68,
+        hydration_record=hydration_record,
+    )
+
+    # History windows used in charts
+    as_of = pd.Timestamp(as_of_date).normalize()
+    history_start = as_of - pd.Timedelta(days=365)
+    key = row.get("name_key")
+    jump_player = bundle.jump[
+        (bundle.jump["name_key"] == key)
+        & (bundle.jump["date"] >= history_start)
+        & (bundle.jump["date"] <= as_of)
+    ].copy()
+    velo_player = bundle.velo[
+        (bundle.velo["name_key"] == key)
+        & (bundle.velo["date"] >= history_start)
+        & (bundle.velo["date"] <= as_of)
+    ].copy()
+    monthly_player = bundle.monthly[
+        (bundle.monthly["name_key"] == key)
+        & (bundle.monthly["as_of_date"] >= history_start)
+        & (bundle.monthly["as_of_date"] <= as_of)
+    ].copy()
+
+    # Five compact trend panels
+    charts_top = table_bottom - 12
+    chart_gap = 8
+    chart_h = 105
+    top_w = (page_w - 68 - chart_gap * 2) / 3
+    bottom_w = (page_w - 68 - chart_gap) / 2
+
+    _pdf_draw_series_chart(
+        c, 34, charts_top - chart_h, top_w, chart_h,
+        "Bodyweight - last 12 months",
+        jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
+        jump_player.get("bodyweight_lb", pd.Series(dtype=float)),
+        "lb", row.get("bw_baseline_lb"),
+    )
+    _pdf_draw_series_chart(
+        c, 34 + top_w + chart_gap, charts_top - chart_h, top_w, chart_h,
+        "CI - last 12 months",
+        jump_player.get("date", pd.Series(dtype="datetime64[ns]")),
+        jump_player.get("ci", pd.Series(dtype=float)),
+        "N s", row.get("ci_baseline"),
+    )
+    _pdf_draw_series_chart(
+        c, 34 + 2 * (top_w + chart_gap), charts_top - chart_h, top_w, chart_h,
+        "FB Velo vs YTD - last 12 months",
+        velo_player.get("date", pd.Series(dtype="datetime64[ns]")),
+        velo_player.get("fb_velo", pd.Series(dtype=float)),
+        "mph", None,
+        second_values=velo_player.get("ytd_fb_velo", pd.Series(dtype=float)),
+        second_label="YTD",
+    )
+
+    second_y = charts_top - chart_h - chart_gap - chart_h
+    _pdf_draw_series_chart(
+        c, 34, second_y, bottom_w, chart_h,
+        "Bat Speed - last 12 months",
+        monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
+        monthly_player.get("monthly_avg_bat_speed", pd.Series(dtype=float)),
+        "mph", row.get("bat_baseline"),
+    )
+    _pdf_draw_series_chart(
+        c, 34 + bottom_w + chart_gap, second_y, bottom_w, chart_h,
+        "Sprint Speed - last 12 months",
+        monthly_player.get("as_of_date", pd.Series(dtype="datetime64[ns]")),
+        monthly_player.get("monthly_max_sprint_speed", pd.Series(dtype=float)),
+        "ft/s", row.get("sprint_baseline"),
+    )
+
+    c.setFillColor(HexColor(SUBTEXT))
+    c.setFont("Helvetica", 6.7)
+    c.drawString(
+        34, 10,
+        f"Flags are review cues only. Metrics with latest data >{MAX_FLAG_AGE_DAYS} days old are shown as stale and cannot generate a flag.",
+    )
+    c.drawRightString(page_w - 34, 10, "Nutrition Early Warning")
+    c.save()
+    return buffer.getvalue()
+
+
+def generate_player_reports_zip(
+    alerts_view: pd.DataFrame,
+    bundle: SourceBundle,
+    as_of_date,
+) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for _, row in alerts_view.sort_values(["team", "athlete"], kind="stable").iterrows():
+            pdf_bytes = generate_player_report_pdf(row, bundle, as_of_date)
+            team_part = safe_filename(str(row.get("team", "Unassigned")))
+            player_part = safe_filename(str(row.get("athlete", "Player")))
+            filename = f"{team_part}/{player_part}_nutrition_report.pdf"
+            zf.writestr(filename, pdf_bytes)
+    return buffer.getvalue()
+
+
 # -----------------------------------------------------------------------------
 # PASSWORD AUTHENTICATION
 # -----------------------------------------------------------------------------
@@ -1329,6 +2027,7 @@ if team_filter != "Full Organization":
 with st.sidebar:
     st.markdown("---")
     st.caption(bundle.status)
+    st.caption(bundle.hydration_status)
     st.caption(f"Bodyweight source column: {bundle.bw_source_col}")
 
 st.title("Nutrition Early Warning")
@@ -1365,7 +2064,9 @@ st.caption(
     velo_tab,
     bat_tab,
     sprint_tab,
+    hydration_tab,
     player_tab,
+    report_tab,
     data_tab,
 ) = st.tabs([
     "Overview",
@@ -1374,7 +2075,9 @@ st.caption(
     "FB Velo",
     "Bat Speed",
     "Sprint Speed",
+    "Hydration",
     "Player Trends",
+    "Player Reports",
     "Data Coverage",
 ])
 
@@ -1690,6 +2393,63 @@ with sprint_tab:
     )
 
 
+# ----- HYDRATION -----
+with hydration_tab:
+    st.subheader("Hydration Testing", anchor=False)
+    st.caption(
+        "Sweat-sodium testing from the separate Hydration spreadsheet plus the DSL tab in the primary reports sheet. "
+        "These results are informational and do not change Review / Monitor / Stable status."
+    )
+    hydration_view = build_hydration_view(bundle, directory, team_filter)
+
+    if hydration_view.empty:
+        st.info("No hydration results are available for the selected team.")
+        if bundle.hydration_status:
+            st.caption(bundle.hydration_status)
+    else:
+        tested = int(hydration_view["sodium_loss_mg_l"].notna().sum())
+        mean_sodium = hydration_view["sodium_loss_mg_l"].mean()
+        high_mask = hydration_view["classification"].isin(["High", "Very High", "Moderate/High"])
+        high_n = int(high_mask.sum())
+        rec_n = int(hydration_view["recommendation"].astype(str).str.strip().ne("").sum())
+
+        h1, h2, h3, h4 = st.columns(4)
+        with h1:
+            st.markdown(metric_card("Hydration results", f"{tested:,}", BLUE), unsafe_allow_html=True)
+        with h2:
+            st.markdown(metric_card("Mean sweat sodium", fmt(mean_sodium, 0, " mg/L"), TEAL), unsafe_allow_html=True)
+        with h3:
+            st.markdown(metric_card("High / very high", f"{high_n:,}", AMBER), unsafe_allow_html=True)
+        with h4:
+            st.markdown(metric_card("Recommendations", f"{rec_n:,}", GREEN), unsafe_allow_html=True)
+
+        hydration_display = hydration_view[[
+            "athlete", "team", "position", "sodium_loss_mg_l",
+            "classification", "recommendation", "source_tab",
+        ]].copy()
+        hydration_display.columns = [
+            "Player", "Team", "Position", "Sweat Sodium (mg/L)",
+            "Classification", "Recommendation", "Source",
+        ]
+        st.dataframe(
+            hydration_display,
+            hide_index=True,
+            use_container_width=True,
+            height=min(760, 44 + 36 * (len(hydration_display) + 1)),
+            column_config={
+                "Sweat Sodium (mg/L)": st.column_config.NumberColumn(format="%.0f mg/L"),
+                "Recommendation": st.column_config.TextColumn(width="large"),
+            },
+        )
+        csv_download_button(
+            hydration_display,
+            "Download hydration results CSV",
+            "hydration_results.csv",
+            "hydration_results_csv",
+        )
+        st.caption(bundle.hydration_status)
+
+
 # ----- PLAYER TRENDS -----
 with player_tab:
     st.subheader("Player Trends", anchor=False)
@@ -1782,6 +2542,92 @@ with player_tab:
                 ),
                 use_container_width=True, config={"displayModeBar": False}, key=f"player_sprint_{key}",
             )
+
+
+# ----- PLAYER REPORTS -----
+with report_tab:
+    st.subheader("Individual Player Reports", anchor=False)
+    st.caption(
+        "Each PDF uses the same current thresholds, freshness rule, team filter, and as-of date as the dashboard. "
+        "The report includes the player's current review status, metric comparisons, sweat-sodium result when available, data age, and 12-month trends."
+    )
+
+    report_players = alerts[["name_key", "athlete", "team", "position", "Status"]].copy()
+    report_players["label"] = report_players.apply(
+        lambda r: f"{r['athlete']} · {r['team']} · {r['Status']}", axis=1
+    )
+
+    if report_players.empty:
+        st.info("No players are available for the selected team filter.")
+    else:
+        selected_report_label = st.selectbox(
+            "Player report",
+            report_players["label"].tolist(),
+            key="player_report_selector",
+        )
+        report_selected = report_players[report_players["label"] == selected_report_label].iloc[0]
+        report_row = alerts[alerts["name_key"] == report_selected["name_key"]].iloc[0]
+        report_pdf = generate_player_report_pdf(report_row, bundle, as_of_date)
+
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            st.markdown(
+                metric_card(
+                    "Status",
+                    str(report_row["Status"]),
+                    ACCENT_RED if report_row["Status"] == "Review" else AMBER if report_row["Status"] == "Monitor" else GREEN,
+                ),
+                unsafe_allow_html=True,
+            )
+        with r2:
+            st.markdown(metric_card("Flagged metrics", str(int(report_row["flagged_metrics"])), BLUE), unsafe_allow_html=True)
+        with r3:
+            st.markdown(metric_card("Fresh comparisons", f"{int(report_row['metrics_with_comparison'])}/5", TEAL), unsafe_allow_html=True)
+        with r4:
+            st.markdown(metric_card("Stale metrics", str(int(report_row["stale_metrics"])), SUBTEXT), unsafe_allow_html=True)
+
+        st.download_button(
+            "Download selected player PDF",
+            data=report_pdf,
+            file_name=f"{safe_filename(report_row['athlete'])}_nutrition_report.pdf",
+            mime="application/pdf",
+            key="download_selected_player_pdf",
+            use_container_width=True,
+            type="primary",
+        )
+
+        st.markdown("---")
+        st.subheader("Batch Player Reports", anchor=False)
+        st.caption(
+            f"Creates one separate PDF for every player in the current view ({len(alerts):,} players) and packages them into a ZIP, organized by team."
+        )
+
+        batch_signature = (
+            str(as_of_date), team_filter, recent_days, baseline_days, bat_min_days, sprint_min_days,
+            bw_direction, bw_monitor_pct, bw_review_pct, ci_monitor_pct, ci_review_pct,
+            velo_monitor_mph, velo_review_mph, bat_monitor_mph, bat_review_mph,
+            sprint_monitor, sprint_review, escalate_multi,
+        )
+        if st.button("Build ZIP of all player reports", key="build_player_report_zip", use_container_width=True):
+            with st.spinner("Building player reports..."):
+                st.session_state["player_report_zip_bytes"] = generate_player_reports_zip(alerts, bundle, as_of_date)
+                st.session_state["player_report_zip_signature"] = batch_signature
+
+        if (
+            st.session_state.get("player_report_zip_bytes")
+            and st.session_state.get("player_report_zip_signature") == batch_signature
+        ):
+            zip_team = "full_organization" if team_filter == "Full Organization" else safe_filename(team_filter)
+            st.download_button(
+                "Download all player reports (.zip)",
+                data=st.session_state["player_report_zip_bytes"],
+                file_name=f"nutrition_player_reports_{zip_team}_{pd.Timestamp(as_of_date).strftime('%Y%m%d')}.zip",
+                mime="application/zip",
+                key="download_player_report_zip",
+                use_container_width=True,
+            )
+        elif st.session_state.get("player_report_zip_bytes"):
+            st.info("Dashboard settings changed. Rebuild the ZIP so the reports match the current filters and thresholds.")
 
 
 # ----- DATA COVERAGE -----
